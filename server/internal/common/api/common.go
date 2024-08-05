@@ -14,3 +14,9 @@ func (i *Common) RasPublicKey(rc *req.Ctx) {
 	biz.ErrIsNilAppendErr(err, "rsa生成公私钥失败")
 	rc.ResData = publicKeyStr
 }
+
+func (i *Common) AesKey(rc *req.Ctx){
+	aesKeyStr,err := cryptox.GetAesKey()
+	biz.ErrIsNilAppendErr(err, "rsa生成公私钥失败")
+	rc.ResData = aesKeyStr
+}

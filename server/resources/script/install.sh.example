@@ -1,0 +1,219 @@
+#!/bin/bash
+#定义通知函数
+function Log::Err() {
+    printf "[x] [$(date +'%Y-%m-%d %H:%M:%S')]: \033[31mError: $@ \033[0m\n"
+}
+function Memu::show() {
+    printf "\033[32m $@ \033[0m\n"
+}
+function Log::Info() {
+    printf "[-] [$(date +'%Y-%m-%d %H:%M:%S')]: \033[32mInfo: $@ \033[0m\n"
+}
+function Log::Warning() {
+    printf "[!] [$(date +'%Y-%m-%d %H:%M:%S')]: \033[33mWarning: $@ \033[0m\n"
+}
+function Log::Die() {
+    Log::Err " $1. Abort!"
+    exit 1
+}
+#添加用户组和用户
+function System::Group_User_Add() {
+    group=$1
+    username=$2
+    if ! egrep "^${group}:x" /etc/group >/dev/null; then
+        Log::Info "User group: [${group}] does not exist and the will be created [${group}]"
+        groupadd ${group} >/dev/null 2>&1
+    fi
+    if ! egrep "^${username}:x" /etc/passwd >/dev/null; then
+        Log::Info "User: [${username}] does not exist and the will be created [${username}]"
+        useradd -g ${group} $username -s /sbin/nologin >/dev/null 2>&1
+    fi
+}
+#检测命令是否存在
+function System::CheckCommand() {
+    cmdname=$1
+    if ! command -v ${cmdname} >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            Log::Err "${cmdname}: The command does not exist, please install the relevant package before trying to install the related service!"
+            return 1
+        elif command -v yum >/dev/null 2>&1; then
+            Log::Err "${cmdname}: The command does not exist, please install the relevant package before trying to install the related service!"
+            return 1
+        elif command -v zypper >/dev/null 2>&1; then
+            Log::Err "${cmdname}: The command does not exist, please install the relevant package before trying to install the related service!"
+            return 1
+        fi
+    fi
+}
+#获取一个较大未被使用的端口
+function System::GetIdlePort() {
+    while true; do
+        # 生成一个在9001到65535之间的随机整数
+        port=$(shuf -i 9001-65535 -n 1)
+        # 检查端口是否被占用
+        if ! ss -tnl | grep -q ":${port}\b"; then
+            printf "${port}"
+            break
+        fi
+    done
+}
+#生成随机字符串，可用于密码
+function Install::RandomPassword() {
+    # 指定要生成的字符串长度
+    local length="${1:-32}"
+    # 生成包括大小写字母及数字的字符集
+    local character_set="[:alnum:]"
+    # 构造随机字符串
+    cat /dev/urandom | tr -dc "${character_set}" | fold -w "${length}" | head -n 1 | tr -d '\n'
+}
+#配置防火墙放行端口
+function System::ConfigFirewall() {
+    ports=("$@")
+    FIREWALL_MANAGER=$(basename $(command -v firewall-cmd || command -v iptables))
+
+    if [ -z "{$FIREWALL_MANAGER}" ]; then
+        Log::Warning "Firewall management software is not installed, skip configuring firewall allowed ports!"
+        return 0
+    fi
+
+    if [ "${FIREWALL_MANAGER}" = "firewall-cmd" ]; then
+        if systemctl is-active --quiet firewalld; then
+            for port in ${ports[@]}; do
+                if ! grep -qs "\<${port}/tcp\>" <(firewall-cmd --list-ports); then
+                    firewall-cmd --add-port=${port}/tcp --zone=public --permanent >/dev/null 2>&1
+                fi
+            done
+            firewall-cmd --reload >/dev/null 2>&1
+            Log::Info "Configured firewall to allow port: ${port}"
+        else
+            Log::Warning "Firewall not started, will skip configured firewall allowed ports:[${ports[@]}]!"
+            return 0
+        fi
+    elif [ "${FIREWALL_MANAGER}" = "iptables" ]; then
+        if systemctl is-active --quiet iptables.service; then
+            for port in ${ports[@]}; do
+                if iptables -C INPUT -p tcp --dport ${port} --jump ACCEPT >/dev/null 2>&1; then
+                    iptables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
+                fi
+            done
+            service iptables save
+            Log::Info "Configured firewall to allow port: ${port}"
+        else
+            Log::Warning "Firewall not started, will skip configured firewall allowed ports:[${ports[@]}] "
+            return 0
+        fi
+    fi
+}
+function install() {
+    CPU_ARCH=$(uname -m)
+    Log::Info "Install mayfly-go Server."
+    pkgFilePath=$1
+    WEB_PORT=18888
+    AESKEY=$(Install::RandomPassword 16)
+    mayfly_BASE=${APPROOT}/mayfly-go
+    mayfly_RUN_GROUP=app
+    mayfly_RUN_USER=mayfly-go
+    mayfly_BIN_PATH=${mayfly_BASE}/mayfly-go
+    mayfly_SERVICE_NAME=mayfly-go
+    if [ -e "${mayfly_BIN_PATH}" ] || [ -e "/etc/systemd/system/${mayfly_SERVICE_NAME}.service" ] || [ -e "/etc/init.d/${mayfly_SERVICE_NAME}" ]; then
+        Log::Warning "mayfly-go Server is already installed and deployed, skip the installation and deployment of mayfly-go Server!"
+        return 1
+    fi
+    System::CheckCommand "netstat" || return 1
+    System::CheckCommand "tar" || return 1
+    if netstat -tpln | grep -q ":${WEB_PORT}"; then
+        local oldport=${WEB_PORT}
+        WEB_PORT=$(System::GetIdlePort)
+        Log::Warning "Port [${oldport}] is occupied and will be replaced with a random unoccupied port: ${WEB_PORT}"
+    fi
+    System::Group_User_Add ${mayfly_RUN_GROUP} ${mayfly_RUN_USER}
+    mkdir -p ${mayfly_BASE}/help
+    tar zxf ${pkgFilePath} -C ${mayfly_BASE} --strip-components 1 2>/dev/null
+    chown -R ${mayfly_RUN_USER}.${mayfly_RUN_GROUP} ${mayfly_BASE}
+    if [ "${CPU_ARCH}" = "x86_64" ]; then
+        Log::Info "The CPU is AMD64 and the amd64 version will be installed: mayfly-go Server."
+        rm -rf ${mayfly_BIN_PATH}.arm64
+        mv ${mayfly_BIN_PATH}.amd64 ${mayfly_BIN_PATH}
+    elif [ "${CPU_ARCH}" = "aarch64" ]; then
+        Log::Info "The CPU is ARM64 and the arm64 version will be installed: mayfly-go Server."
+        rm -rf ${mayfly_BIN_PATH}.amd64
+        mv ${mayfly_BIN_PATH}.arm64 ${mayfly_BIN_PATH}
+    else
+        Log::Die "This CPU architecture is not supported"
+    fi
+    mv ${mayfly_BASE}/config/config.yml ${mayfly_BASE}/config/config.yml.bak
+    mv ${mayfly_BASE}/config/config.yml mv ${mayfly_BASE}/config/config-sqlite.yml
+    echo "sed -i 's|1111111111111111|${AESKEY}|g' ${mayfly_BASE}/config/config.yml" | bash
+    echo "sed -i 's|port: 18888|port: ${WEB_PORT}|g' ${mayfly_BASE}/config/config.yml" | bash
+    chmod +x ${mayfly_BIN_PATH}
+    System::ConfigFirewall "${WEB_PORT}"
+    if command -v systemctl >/dev/null 2>&1; then
+        cat >/etc/systemd/system/${mayfly_SERVICE_NAME}.service <<EOF
+[Unit]
+Description=mayfly-go Server
+After=syslog.target network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/sh ${mayfly_BASE}/startup.sh
+ExecStop=/usr/bin/sh ${mayfly_BASE}/shutdown.sh
+LimitNOFILE=65535
+LimitNPROC=100000
+LimitMEMLOCK=infinity
+PrivateTmp=true
+User=${mayfly_RUN_USER}
+Group=${mayfly_RUN_GROUP}
+WorkingDirectory=${mayfly_BASE}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now ${mayfly_SERVICE_NAME} >/dev/null 2>&1
+        echo "30 1 * * * /usr/bin/rm -rf ${APPROOT}/mayfly-go/.mayfly_aes" >>/var/spool/cron/root
+        cat >${mayfly_BASE}/help/install.cfg <<EOF
+mayfly-go Install Dir: ${mayfly_BASE}
+mayfly-go Port: ${WEB_PORT}
+mayfly-go Default User/Password: admin/HzLJ@2024.
+mayfly-go server is-enabled: $(systemctl is-enabled ${mayfly_SERVICE_NAME})
+mayfly-go server start: systemctl start ${mayfly_SERVICE_NAME}
+mayfly-go server stop: systemctl stop ${mayfly_SERVICE_NAME}
+mayfly-go server restart: systemctl restart ${mayfly_SERVICE_NAME}
+EOF
+        cp /etc/systemd/system/${mayfly_SERVICE_NAME}.service ${mayfly_BASE}/help/
+    fi
+    Log::Info "mayfly-go Server installation configuration is complete, the following is the installation information:"
+    while read line; do
+        Log::Info "[-] \t${line}"
+    done <${mayfly_BASE}/help/install.cfg
+    return 0
+}
+function main() {
+    APPROOT=${1:-/opt/apps}
+    id=$$
+    fileMd5="mayfly-go-MD5"
+    tempdir=/tmp/${id}
+    mkdir -p ${tempdir}/mayfly-go
+    tempfile=${tempdir}/temp
+    pkgFilePath=${tempdir}/install.${id}.tar.gz
+    skip_rownum=$(awk '/^#__BIN_FILE_BEGIN__/ {print NR + 1; exit 0; }' "$0")
+    tail -n +${skip_rownum} "$0" >${tempfile}
+    base64 -d ${tempfile} >${pkgFilePath}
+    tempmd5=$(md5sum ${pkgFilePath} | awk '{print $1}')
+    if [ "${fileMd5}" != "${tempmd5}" ]; then
+        rm -rf ${tempdir}
+        Log::Die "mayfly-go installation failed: The file verification failed, check whether the file is corrupted"
+    fi
+    install ${pkgFilePath}
+    rm -rf ${tempdir}
+    exit 0
+}
+if [ "$(id -u)" -ne 0 ]; then
+    Log::Die "You must execute it with root privileges, or add (sudo) before installing the command"
+    exit 1
+fi
+main
+#__BIN_FILE_BEGIN__
